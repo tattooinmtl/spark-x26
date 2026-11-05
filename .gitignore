@@ -1,0 +1,23 @@
+# The llama.cpp builds and the model are not in the repo.
+llama/
+models/
+*.gguf
+
+# Runtime state.
+logs/
+workspace/
+last-project.txt
+config.json
+
+# Python.
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors and OS.
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
