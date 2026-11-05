@@ -56,7 +56,7 @@ def paint(text: str, style: str = "") -> str:
     return f"{COLORS[style]}{text}{COLORS['off']}"
 
 
-def run(command: list, cwd: Path | None = None, timeout: int = 300) -> tuple:
+def run_cmd(command: list, cwd: Path | None = None, timeout: int = 300) -> tuple:
     try:
         proc = subprocess.run(
             command,
@@ -150,13 +150,13 @@ def check_git() -> bool:
         print("   clone it first:")
         print(f"     git clone {REPO_URL} \"{ROOT}\"")
         return False
-    code, out = run(["git", "remote", "get-url", "origin"], cwd=ROOT)
+    code, out = run_cmd(["git", "remote", "get-url", "origin"], cwd=ROOT)
     if code != 0:
-        run(["git", "remote", "add", "origin", REPO_URL], cwd=ROOT)
+        run_cmd(["git", "remote", "add", "origin", REPO_URL], cwd=ROOT)
         good(f"added the remote {REPO_URL}")
     else:
         good(f"remote origin -> {out.strip()}")
-    code, out = run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT)
+    code, out = run_cmd(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT)
     if code == 0:
         good(f"on commit {out.strip()}")
     return True
@@ -316,7 +316,7 @@ def write_config(model: Path | None, llama: Path | None) -> None:
 
 def run_selftest() -> None:
     step("running the self-test")
-    code, out = run([sys.executable, str(HERE / "selftest.py")], cwd=HERE, timeout=600)
+    code, out = run_cmd([sys.executable, str(HERE / "selftest.py")], cwd=HERE, timeout=600)
     tail = [line for line in out.splitlines() if line.startswith("[FAIL]")]
     if code == 0:
         good("self-test passed")
