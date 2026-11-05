@@ -1,15 +1,28 @@
-# Spark X2.6 — local llama.cpp setup
+# Spark Code 2.6 — a local coding agent for Spark X2.6
 
 Everything for running **Spark-X2.6-4B** (XHToken) on this machine, plus a
-small coding agent built around it.
+coding agent built around it.
+
+```bat
+spark              start the coding agent
+spark ui           start the llama.cpp web UI on :8081
+spark update       pull a new version from the git repo
+```
+
+Installed at `C:\Users\ThePa\.spark-code26`, from
+**https://github.com/tattooinmtl/spark-x26**. The source lives in
+`C:\models\spark26` — see [Dev and production](#dev-and-production).
 
 ```
 C:\models\spark26\
 ├── start_spark26.bat            server / cli / bench launcher
 ├── start_spark26_agent.bat      coding agent launcher
+├── install.cmd                  one-shot setup for a fresh clone
 ├── spark26-chat-template.jinja  Spark's chat template (pretty-printed)
 ├── harness\
 │   ├── spark_agent.py           the agent: tools, skills, agent loop
+│   ├── spark_cli.py             the `spark` command
+│   ├── install.py               the installer behind install.cmd
 │   ├── tui.py                   terminal UI: banner, input box, footer
 │   ├── commands.py              the slash commands
 │   ├── webtools.py              web_search, web_fetch, headless browser
@@ -60,6 +73,9 @@ The model is **not** in the repo (4 GB). The installer looks for
 `Spark-X2.6-4B-Q8_0.gguf` in the install folder, then in `C:\models`, and
 falls back to any `Spark-X2.6*.gguf` it finds there. `SPARK_MODEL` and
 `SPARK_LLAMA_DIR` override both.
+
+The two launchers (`start_spark26.bat`, `start_spark26_agent.bat`) are
+still there and still work; `spark` is the short way in.
 
 ## Dev and production
 
