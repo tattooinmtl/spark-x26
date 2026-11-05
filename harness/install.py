@@ -326,6 +326,35 @@ def run_selftest() -> None:
             print(f"    {line}")
 
 
+def seed_remembered_project() -> None:
+    """Carry the project across from an earlier install, if there is one.
+
+    The agent remembers the project it was last used on in a file next to
+    the code. A fresh install has none, so the one from a previous
+    checkout is copied over when it exists.
+    """
+    target = ROOT / "last-project.txt"
+    if target.exists():
+        good(f"the remembered project is already set ({target.read_text(encoding='utf-8').strip()})")
+        return
+    for earlier in (Path(r"C:\models\spark26"),):
+        source = earlier / "last-project.txt"
+        if not source.is_file():
+            continue
+        try:
+            value = source.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not value:
+            continue
+        try:
+            target.write_text(value + "\n", encoding="utf-8")
+            good(f"remembered project carried over: {value.strip(chr(34))}")
+            return
+        except OSError:
+            return
+
+
 def run(args: list) -> int:
     print()
     print(paint(" SPARK CODE 2.6 ", "bold") + paint(" installer", "dim"))
@@ -337,6 +366,7 @@ def run(args: list) -> int:
     llama = install_llama()
     model = install_model("--model" in args)
     write_config(model, llama)
+    seed_remembered_project()
     install_launcher()
     run_selftest()
 

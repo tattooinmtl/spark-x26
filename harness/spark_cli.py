@@ -32,7 +32,7 @@ ROOT = HERE.parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-VERSION = "2.6.0"
+VERSION = "2.6.1"
 REPO_URL = "https://github.com/tattooinmtl/spark-x26.git"
 DEFAULT_INSTALL = Path(os.environ.get("SPARK_HOME", Path.home() / ".spark-code26"))
 
@@ -193,12 +193,28 @@ def cmd_agent(args: list) -> int:
 
 
 def cmd_ui(args: list) -> int:
-    """Start the llama.cpp web UI."""
+    """Start the llama.cpp web UI.
+
+    The launcher takes its arguments in a fixed order - mode, thinking
+    level, build, project - so a bare folder in the argument list is put
+    where it belongs instead of being read as a thinking level.
+    """
     launcher = ROOT / "start_spark26.bat"
     if not launcher.is_file():
         print(paint(f"missing {launcher}", "red"))
         return 1
-    return subprocess.call(["cmd", "/c", str(launcher), "server"] + args)
+    project = None
+    rest = []
+    for argument in args:
+        if project is None and os.path.isdir(argument):
+            project = argument
+        else:
+            rest.append(argument)
+    command = ["server", "high", "b11873"]
+    if project:
+        command.append(project)
+    command.extend(rest)
+    return subprocess.call(["cmd", "/c", str(launcher)] + command)
 
 
 def cmd_bench(args: list) -> int:
