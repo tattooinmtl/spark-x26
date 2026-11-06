@@ -1348,7 +1348,11 @@ class ServerEngine:
             except OSError:
                 pass
             conn.close()
-            thread.join(timeout=2)
+            # On Windows a thread blocked in recv() is not woken by shutdown
+            # or close; it ends by itself when the server stops sending. The
+            # shutdown has already told llama-server to stop, so the reader
+            # thread (a daemon) is left to finish instead of waited for.
+            thread.join(timeout=0.2)
         else:
             conn.close()
         if cancelled:

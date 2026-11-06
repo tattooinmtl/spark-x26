@@ -9,6 +9,10 @@ from pathlib import Path
 H = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, H)
 import spark_agent as a, tui
 
+# The agent switches stdout to UTF-8 in main(); this test does not go
+# through main(), and a Windows pipe is cp1252.
+a.use_utf8_console()
+
 SCRIPT = []      # list of (delay_before, [pieces], stop_type)
 PROMPTS = []
 class Fake(BaseHTTPRequestHandler):
@@ -28,7 +32,7 @@ class Fake(BaseHTTPRequestHandler):
             fin = {"content":"","stop":True,"stop_type":stop_type,"tokens_predicted":n,"tokens_evaluated":100,
                    "timings":{"prompt_n":10,"cache_n":90,"predicted_per_second":7.0}}
             self.wfile.write(f"data: {json.dumps(fin)}\n\n".encode()); self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError): pass
+        except OSError: pass   # the client cut the stream (Esc, thinking budget)
 srv = ThreadingHTTPServer(("127.0.0.1", 0), Fake); threading.Thread(target=srv.serve_forever, daemon=True).start()
 port = srv.server_address[1]
 
