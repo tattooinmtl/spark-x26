@@ -469,8 +469,15 @@ def test_winproc():
     pid = winproc.port_pid(8082)
     check("winproc: the port lookup answers", isinstance(pid, int), True)
 
-    # A port with nothing of ours on it must not be touched.
-    note = winproc.kill_server_on_port(8082, str(Path(__file__).resolve().parent.parent))
+    # A port with nothing of ours on it must not be touched. Pick a port
+    # that is free right now, so the check does not trip over an agent
+    # that happens to be running on the usual one.
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        free_port = probe.getsockname()[1]
+    note = winproc.kill_server_on_port(free_port, str(Path(__file__).resolve().parent.parent))
     check("winproc: killing on a free port does nothing", note, "")
 
     # A job with KILL_ON_JOB_CLOSE: the handle has to survive.
