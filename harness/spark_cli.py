@@ -148,6 +148,12 @@ def cmd_doctor(args: list) -> int:
     exe = llama / "llama-server.exe"
     if exe.is_file():
         print(f"  {paint('ok', 'green')}  llama.cpp   {llama}")
+        if (llama / "ggml-cuda.dll").is_file():
+            print(f"  {paint('ok', 'green')}  engine      GPU (CUDA build)")
+        elif (llama / "ggml-vulkan.dll").is_file():
+            print(f"  {paint('ok', 'green')}  engine      GPU (Vulkan build)")
+        else:
+            print(f"  {paint('--', 'dim')}  engine      CPU only - run: spark cuda install")
     else:
         ok = False
         print(f"  {paint('!!', 'yellow')}  llama.cpp   not found: {llama}")
@@ -228,6 +234,30 @@ def cmd_install(args: list) -> int:
     return installer.run(args)
 
 
+def cmd_hardware(args: list) -> int:
+    import install as installer
+
+    installer.print_hardware()
+    return 0
+
+
+def cmd_cuda(args: list) -> int:
+    """spark cuda [install|status]: the GPU build that fits this PC."""
+    import install as installer
+
+    action = (args[0].lower() if args else "status")
+    if action in ("install", "setup", "on"):
+        return 0 if installer.install_accelerated(args[1:]) is not None else 1
+    installer.print_hardware()
+    return 0
+
+
+def cmd_repair(args: list) -> int:
+    import install as installer
+
+    return installer.repair(args)
+
+
 def cmd_version(args: list) -> int:
     print(f"Spark Code {VERSION}")
     code, out = run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT)
@@ -247,6 +277,9 @@ HELP = f"""
   {paint('spark update', 'accent')}       pull a new version from the git repo
   {paint('spark install', 'accent')}      set this machine up
   {paint('spark doctor', 'accent')}       check the environment
+  {paint('spark hardware', 'accent')}     show the CPU, RAM, GPU and NPU and the best engine
+  {paint('spark cuda install', 'accent')} install the GPU build that fits this PC (CUDA, Vulkan or CPU)
+  {paint('spark repair', 'accent')}       fix a broken install (--restore also resets changed files)
   {paint('spark version', 'accent')}      print the version
   {paint('spark help', 'accent')}         this text
 
@@ -285,6 +318,12 @@ def main(argv: list | None = None) -> int:
         return cmd_ui(rest)
     if command in ("bench", "--bench"):
         return cmd_bench(rest)
+    if command in ("hardware", "hw", "--hardware"):
+        return cmd_hardware(rest)
+    if command in ("cuda", "gpu", "--cuda", "--gpu"):
+        return cmd_cuda(rest)
+    if command in ("repair", "fix", "--repair"):
+        return cmd_repair(rest)
 
     # Anything else is the agent's own argument list.
     return cmd_agent(argv)

@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import time
 
 # --------------------------------------------------------------------------
 # Palette - PI.DEV's dark theme, with Claude Code's orange input border
@@ -403,10 +404,60 @@ class PromptBox:
         self.cursor = 0
 
 
+# Windows console key codes after the \x00 / \xe0 prefix byte.
+_PREFIXED_KEYS = {
+    "H": "up", "P": "down", "K": "left", "M": "right",
+    "G": "home", "O": "end", "S": "delete", "I": "pageup", "Q": "pagedown",
+    "s": "ctrl-left", "t": "ctrl-right",
+}
+# The same keys as VT sequences (Windows Terminal with VT input, or tests).
+_VT_KEYS = {"A": "up", "B": "down", "D": "left", "C": "right", "H": "home", "F": "end"}
+
+
+def read_key(msvcrt) -> str:
+    """One key press from the Windows console, as a name or a character.
+
+    msvcrt.getwch() returns arrows, Home, End and Delete as two calls: a
+    prefix ("\x00" or "\xe0") and a code letter. "\xe0" is also the
+    letter a-grave, so it must never be taken as typed text. A lone Esc
+    has nothing queued behind it; an escape sequence does.
+    """
+    char = msvcrt.getwch()
+    if char in ("\x00", "\xe0"):
+        return _PREFIXED_KEYS.get(msvcrt.getwch(), "")
+    if char == "\x1b":
+        if not msvcrt.kbhit():
+            return "esc"
+        nxt = msvcrt.getwch()
+        if nxt != "[":
+            # Esc then an ordinary key typed quickly: keep that key.
+            try:
+                msvcrt.ungetwch(nxt)
+            except Exception:
+                pass
+            return "esc"
+        code = msvcrt.getwch()
+        if code == "3" and msvcrt.kbhit():
+            msvcrt.getwch()            # the "~" of ESC [ 3 ~
+            return "delete"
+        return _VT_KEYS.get(code, "")
+    names = {"\r": "enter", "\n": "newline", "\x08": "backspace", "\x7f": "ctrl-backspace",
+             "\x03": "ctrl-c", "\x04": "ctrl-d", "\x15": "ctrl-u", "\x17": "ctrl-w",
+             "\t": "tab", "\x01": "home", "\x05": "end"}
+    if char in names:
+        return names[char]
+    if ord(char) < 32:
+        return ""
+    return char
+
+
 def read_prompt(prompt_box: PromptBox, history: list | None = None) -> str:
     """Read one instruction, with a live box when the console allows it.
 
     Returns the text, or raises KeyboardInterrupt when the user aborts.
+    Enter sends; Ctrl+J adds a new line; a pasted block keeps its new
+    lines (an Enter with more keys already queued behind it is part of a
+    paste, not a key press). Up/Down walk the history.
     """
     try:
         import msvcrt  # noqa: PLC0415  (Windows only)
@@ -421,75 +472,66 @@ def read_prompt(prompt_box: PromptBox, history: list | None = None) -> str:
         return _plain_prompt(prompt_box)
 
     box = prompt_box
-    history = history or []
+    if history is None:
+        history = []
     hist_index = len(history)
+    draft = ""
     box.draw()
 
     while True:
-        try:
-            char = msvcrt.getwch()
-        except KeyboardInterrupt:
-            raise
-        if char in ("\r", "\n"):
+        key = read_key(msvcrt)
+        if key == "enter" and msvcrt.kbhit():
+            key = "newline"            # part of a paste
+        if key == "enter":
             box.finish()
             text = box.text.strip().lstrip("\ufeff").strip()
-            if text and history and history[-1] != text:
+            if text and (not history or history[-1] != text):
                 history.append(text)
             # The submitted instruction stays on screen, but the next one
             # starts empty - otherwise it would be typed onto the end of
             # the last one.
             box.clear()
             return text
-        if char == "\x03":          # Ctrl+C
+        if key == "ctrl-c":
             box.finish()
             raise KeyboardInterrupt
-        if char == "\x1b":          # escape sequence
-            nxt = msvcrt.getwch()
-            if nxt == "[":
-                code = msvcrt.getwch()
-                if code == "D":
-                    box.move(-1)
-                elif code == "C":
-                    box.move(1)
-                elif code == "H":
-                    box.cursor = 0
-                elif code == "F":
-                    box.cursor = len(box.text)
-                elif code in ("A", "B"):
-                    if history:
-                        if code == "A":
-                            hist_index = max(0, hist_index - 1)
-                        else:
-                            hist_index = min(len(history), hist_index + 1)
-                        if hist_index < len(history):
-                            box.text = history[hist_index]
-                            box.cursor = len(box.text)
-                        else:
-                            box.clear()
-                box.draw()
-                continue
-            box.draw()
-            continue
-        if char == "\x08":          # backspace
-            box.backspace()
-        elif char == "\x00":        # control char prefix (some keys)
-            msvcrt.getwch()
-            continue
-        elif char == "\x15":        # Ctrl+U
-            box.kill_line()
-        elif char == "\x17":        # Ctrl+W
-            box.kill_word()
-        elif char == "\x04":        # Ctrl+D
+        if key == "ctrl-d":
             if not box.text:
                 box.finish()
                 raise EOFError
             box.delete()
-        elif char == "\x12":        # Ctrl+R - not bound, ignore
-            continue
-        elif ord(char) < 32:
-            continue
+        elif key == "newline":
+            box.insert("\n")
+        elif key == "left":
+            box.move(-1)
+        elif key == "right":
+            box.move(1)
+        elif key == "home":
+            box.cursor = 0
+        elif key == "end":
+            box.cursor = len(box.text)
+        elif key in ("up", "down"):
+            if not history:
+                continue
+            if hist_index == len(history):
+                draft = box.text
+            hist_index = max(0, hist_index - 1) if key == "up" else min(len(history), hist_index + 1)
+            box.text = history[hist_index] if hist_index < len(history) else draft
+            box.cursor = len(box.text)
+        elif key == "backspace":
+            box.backspace()
+        elif key == "delete":
+            box.delete()
+        elif key == "ctrl-u":
+            box.kill_line()
+        elif key in ("ctrl-w", "ctrl-backspace"):
+            box.kill_word()
+        elif key == "esc":
+            box.clear()
+        elif len(key) == 1:
+            box.insert(key)
         else:
-            box.insert(char)
+            continue
         box.draw()
 
 
@@ -550,6 +592,8 @@ def status_line(
             left_parts.append(theme.paint(chunk, "warning"))
         else:
             left_parts.append(theme.paint(chunk, "dim"))
+    if stats.get("cache_pct") is not None:
+        left_parts.append(theme.paint(f"cache {stats['cache_pct']:.0f}%", "dim"))
     if stats.get("tools") is not None:
         left_parts.append(theme.paint(f"{stats['tools']} tools", "dim"))
     if stats.get("turns") is not None:
@@ -571,3 +615,154 @@ def context_line(width: int, workspace: str, branch: str, session: str,
     right = theme.paint(f"session {session}", "dim")
     gap = max(1, width - display_width(left) - display_width(right))
     return left + " " * gap + right
+
+
+# --------------------------------------------------------------------------
+# Live output while the model generates
+# --------------------------------------------------------------------------
+THINK_CLOSE = "</think>"
+TOOL_TAG = "<tool_call>"
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def esc_pressed() -> bool:
+    """True when Esc was pressed since the last check (Windows console).
+
+    Keys typed while the model is working are drained here, so a stray key
+    cannot land in the next prompt half-typed.
+    """
+    try:
+        import msvcrt  # noqa: PLC0415  (Windows only)
+    except ImportError:
+        return False
+    if not sys.stdin.isatty():
+        return False
+    hit = False
+    try:
+        while msvcrt.kbhit():
+            char = msvcrt.getwch()
+            if char == "\x1b":
+                hit = True
+            elif char in ("\x00", "\xe0") and msvcrt.kbhit():
+                msvcrt.getwch()
+    except Exception:
+        return False
+    return hit
+
+
+class StreamView:
+    """Shows a generation as it streams.
+
+    The thinking block is folded into one dim status line that counts
+    tokens and seconds; the answer text is printed as it arrives; the raw
+    <tool_call> markup is never printed - the agent prints a short line per
+    call instead. Without a colour console it only prints the answer text.
+    """
+
+    def __init__(self, theme: Theme | None = None, thinking: bool = True, out=None):
+        self.theme = theme or THEME
+        self.out = out or sys.stdout
+        self.live = self.theme.enabled
+        self.in_think = thinking
+        self.started = time.time()
+        self.raw = ""
+        self.tokens = 0
+        self.think_tokens = 0
+        self.content_start = 0
+        self.printed = 0
+        self.hidden = False
+        self.content_shown = False
+        self.line_open = False
+        self.status_shown = False
+        self._spin = 0
+
+    # -- status line -----------------------------------------------------
+    def _elapsed(self) -> float:
+        return time.time() - self.started
+
+    def _label(self) -> str:
+        if self.in_think:
+            if self.think_tokens:
+                return f"thinking · {self.think_tokens} tokens · {self._elapsed():.0f}s  (Esc to stop)"
+            return f"reading the prompt · {self._elapsed():.0f}s  (Esc to stop)"
+        if self.hidden:
+            return f"writing a tool call · {self.tokens} tokens · {self._elapsed():.0f}s  (Esc to stop)"
+        if not self.tokens:
+            return f"reading the prompt · {self._elapsed():.0f}s  (Esc to stop)"
+        return f"working · {self._elapsed():.0f}s"
+
+    def tick(self):
+        """Redraw the status line (called while waiting for tokens)."""
+        if not self.live or self.line_open:
+            return
+        self._spin = (self._spin + 1) % len(SPINNER)
+        text = self.theme.paint(f"{SPINNER[self._spin]} {self._label()}", "dim")
+        self.out.write("\r\x1b[2K" + text)
+        self.out.flush()
+        self.status_shown = True
+
+    def _clear_status(self):
+        if self.status_shown:
+            self.out.write("\r\x1b[2K")
+            self.status_shown = False
+
+    # -- tokens ----------------------------------------------------------
+    def feed(self, piece: str):
+        self.tokens += 1
+        self.raw += piece
+        if self.in_think:
+            index = self.raw.find(THINK_CLOSE)
+            if index < 0:
+                self.think_tokens += 1
+                return
+            self.in_think = False
+            self.content_start = index + len(THINK_CLOSE)
+            if self.live:
+                self._clear_status()
+                self.out.write(self.theme.paint(
+                    f"✻ thought for {self._elapsed():.0f}s ({self.think_tokens} tokens) · /thinking shows it",
+                    "dim") + "\n")
+                self.out.flush()
+        self._flush_content(final=False)
+
+    def _flush_content(self, final: bool):
+        if self.hidden or self.in_think:
+            return
+        content = self.raw[self.content_start:]
+        cut = content.find(TOOL_TAG)
+        if cut >= 0:
+            visible = content[:cut]
+        else:
+            visible = content
+            if not final:
+                # Hold back what could be the start of a <tool_call> tag.
+                for size in range(min(len(TOOL_TAG) - 1, len(visible)), 0, -1):
+                    if TOOL_TAG.startswith(visible[-size:]):
+                        visible = visible[:-size]
+                        break
+        new = visible[self.printed:]
+        if not self.content_shown:
+            stripped = new.lstrip()
+            self.printed += len(new) - len(stripped)
+            new = stripped
+        if new:
+            self._clear_status()
+            self.out.write(new)
+            self.out.flush()
+            self.printed += len(new)
+            self.content_shown = True
+            self.line_open = not new.endswith("\n")
+        if cut >= 0:
+            self.hidden = True
+            if self.line_open:
+                self.out.write("\n")
+                self.line_open = False
+
+    def finish(self):
+        """End the view: flush what is left and leave the caret on a new line."""
+        self._flush_content(final=True)
+        self._clear_status()
+        if self.line_open:
+            self.out.write("\n")
+            self.line_open = False
+        self.out.flush()

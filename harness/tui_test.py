@@ -345,12 +345,14 @@ def test_read_prompt():
     def check(label, got, want):
         report(label, got, want, failures)
 
-    import msvcrt  # noqa: PLC0415  (Windows only)
+    msvcrt = fake_keyboard()
 
     keys = list("hello\r")
     saved_getwch = msvcrt.getwch
+    saved_kbhit = getattr(msvcrt, "kbhit", None)
     saved_stdin = sys.stdin
     msvcrt.getwch = lambda: keys.pop(0) if keys else ""
+    msvcrt.kbhit = lambda: bool(keys)
 
     class FakeStdin:
         def isatty(self):
@@ -385,9 +387,84 @@ def test_read_prompt():
         check("tui: there are two boxes", screen.screen().count("╭"), 2)
     finally:
         msvcrt.getwch = saved_getwch
+        if saved_kbhit is not None:
+            msvcrt.kbhit = saved_kbhit
         sys.stdin = saved_stdin
         driver.restore()
 
+    return failures
+
+
+def fake_keyboard():
+    """msvcrt, or a stand-in module where it does not exist (not Windows)."""
+    try:
+        import msvcrt  # noqa: PLC0415  (Windows only)
+        return msvcrt
+    except ImportError:
+        import types  # noqa: PLC0415
+
+        module = types.ModuleType("msvcrt")
+        module.getwch = lambda: ""
+        module.kbhit = lambda: False
+        sys.modules["msvcrt"] = module
+        return module
+
+
+def test_keys():
+    """Arrows, history, paste, Esc - as the Windows console sends them."""
+    failures = []
+
+    def check(label, got, want):
+        report(label, got, want, failures)
+
+    msvcrt = fake_keyboard()
+    saved = (msvcrt.getwch, getattr(msvcrt, "kbhit", None), sys.stdin)
+
+    class FakeStdin:
+        def isatty(self):
+            return True
+
+    def run(keys, history=None):
+        queue = list(keys)
+        msvcrt.getwch = lambda: queue.pop(0) if queue else "\r"
+        msvcrt.kbhit = lambda: bool(queue)
+        msvcrt.ungetwch = lambda char: queue.insert(0, char)
+        driver = BoxDriver()
+        try:
+            return tui.read_prompt(driver.box, history), driver
+        finally:
+            driver.restore()
+
+    sys.stdin = FakeStdin()
+    try:
+        # Left arrow twice then "X": arrows arrive as "\xe0" + "K".
+        text, _ = run(["a", "b", "c", "\xe0", "K", "\xe0", "K", "X", "\r"])
+        check("keys: left arrow moves the caret (no a-grave typed)", text, "aXbc")
+        text, _ = run(["a", "b", "\x00", "G", "X", "\xe0", "O", "Y", "\r"])
+        check("keys: Home and End", text, "XabY")
+        text, _ = run(["a", "b", "c", "\xe0", "G", "\xe0", "S", "\r"])
+        check("keys: Delete", text, "bc")
+        history = []
+        run(list("first") + ["\r"], history)
+        run(list("second") + ["\r"], history)
+        check("keys: history records every instruction", history, ["first", "second"])
+        text, _ = run(["\xe0", "H", "\xe0", "H", "\r"], history)
+        check("keys: Up recalls the history", text, "first")
+        text, _ = run(["d", "r", "\xe0", "H", "\xe0", "P", "\r"], history)
+        check("keys: Down returns to the draft", text, "dr")
+        text, _ = run(list("one") + ["\r"] + list("two") + ["\r"])
+        check("keys: a pasted block keeps its lines", text, "one\ntwo")
+        text, _ = run(["a", "\n", "b", "\r"])
+        check("keys: Ctrl+J adds a new line", text, "a\nb")
+        text, _ = run(["x", "y", "\x1b", "o", "k", "\r"])
+        check("keys: Esc clears the box and keeps the next key", text, "ok")
+        text, _ = run(["a", "b", "\x7f", "c", "\r"])
+        check("keys: Ctrl+Backspace types nothing", "\x7f" in text, False)
+    finally:
+        msvcrt.getwch = saved[0]
+        if saved[1] is not None:
+            msvcrt.kbhit = saved[1]
+        sys.stdin = saved[2]
     return failures
 
 
@@ -399,6 +476,7 @@ def main() -> int:
         test_banner_survives,
         test_wrapping,
         test_read_prompt,
+        test_keys,
     ):
         print(f"--- {test.__name__}")
         failures.extend(test())

@@ -111,25 +111,78 @@ def _mcp_status(ctx: Context) -> dict:
 # --------------------------------------------------------------------------
 # Help
 # --------------------------------------------------------------------------
+HELP_GROUPS = (
+    ("Session", ("/help", "/clear", "/compact", "/autocompact", "/resume", "/history",
+                 "/status", "/transcript", "/exit")),
+    ("Model", ("/settings", "/set", "/model", "/reasoning", "/thinking", "/providers", "/cost")),
+    ("Project", ("/project", "/diff", "/tools", "/skills", "/skill", "/mcp", "/web", "/browser")),
+    ("Setup and maintenance", ("/update", "/cuda", "/hardware", "/doctor", "/repair",
+                               "/version", "/about")),
+)
+
+
+class AgentTask:
+    """A slash command that turns into an instruction for the agent."""
+
+    def __init__(self, text: str):
+        self.text = text
+
+
+def primary_commands() -> dict:
+    """{name: entry} for every command under its real name, aliases left out."""
+    alias_names = {alias for entry in REGISTRY.values() for alias in entry["aliases"]}
+    return {name: entry for name, entry in REGISTRY.items() if name not in alias_names}
+
+
+def skill_commands(ctx) -> dict:
+    """{"/name": skill} for every skill that declares `command:` in its header."""
+    out = {}
+    for skill in getattr(ctx, "skills", None) or []:
+        for name in (skill.get("command") or "").split():
+            if name.startswith("/"):
+                out[name.lower()] = skill
+    return out
+
+
+def skill_command_names(skill: dict) -> list:
+    """The slash names a skill declared, the first one being its main name."""
+    return [n.lower() for n in (skill.get("command") or "").split() if n.startswith("/")]
+
+
 @command("/help", "show every command", aliases=("/?", "/h"))
 def cmd_help(ctx: Context):
     theme = ctx.theme
-    theme_ = theme
-    out = [theme_.paint("Commands", "bold")]
-    seen = set()
-    for name in sorted(REGISTRY):
-        entry = REGISTRY[name]
-        if entry["func"] in seen:
-            continue
-        seen.add(entry["func"])
+    primaries = primary_commands()
+
+    def row(name: str, entry: dict) -> str:
         aliases = ""
         if entry["aliases"]:
-            aliases = theme_.paint(f"  ({', '.join(entry['aliases'])})", "dim")
-        out.append(
-            f"  {theme_.paint(name.ljust(14), 'accent')}{entry['summary']}{aliases}"
-        )
-    out.append("")
-    out.append(theme_.paint("Anything that does not start with / is sent to the agent.", "dim"))
+            aliases = theme.paint(f"  ({', '.join(entry['aliases'])})", "dim")
+        return f"  {theme.paint(name.ljust(14), 'accent')}{entry['summary']}{aliases}"
+
+    out = []
+    listed = set()
+    for title, names in HELP_GROUPS:
+        rows = [row(name, primaries[name]) for name in names if name in primaries]
+        listed.update(names)
+        if rows:
+            out += [theme.paint(title, "bold"), *rows, ""]
+    rest = [row(name, entry) for name, entry in sorted(primaries.items()) if name not in listed]
+    if rest:
+        out += [theme.paint("More", "bold"), *rest, ""]
+    skills = skill_commands(ctx)
+    if skills:
+        out.append(theme.paint("Skills", "bold"))
+        seen = set()
+        for skill in skills.values():
+            if skill["id"] in seen:
+                continue
+            seen.add(skill["id"])
+            name, *others = skill_command_names(skill)
+            extra = theme.paint(f"  ({', '.join(others)})", "dim") if others else ""
+            out.append(f"  {theme.paint(name.ljust(14), 'accent')}{skill['description']}{extra}")
+        out.append("")
+    out.append(theme.paint("Esc stops the model. Anything that does not start with / is sent to the agent.", "dim"))
     return _lines(*out)
 
 
@@ -268,31 +321,50 @@ def cmd_model(ctx: Context):
     return theme.paint(message, "success")
 
 
-@command("/reasoning", "show or set the thinking level: none, low, high", aliases=("/think",))
+REASONING_LEVELS = {
+    "none": "no thinking block, fastest answers",
+    "low": "short thinking block (budget 1024 tokens)",
+    "high": "long thinking block (budget 4096 tokens)",
+    "max": "high with no thinking budget - the model thinks as long as it wants",
+}
+
+
+def reasoning_level(cfg) -> str:
+    if cfg.think == "high" and int(getattr(cfg, "think_budget", 0) or 0) >= int(cfg.max_tokens):
+        return "max"
+    return cfg.think
+
+
+@command("/reasoning", "show or set the thinking level: none, low, high, max", aliases=("/think",))
 def cmd_reasoning(ctx: Context):
     theme = ctx.theme
     argument = (ctx.agent.current_argument or "").strip().lower()
+    argument = {"off": "none"}.get(argument, argument)
+    if argument in ("med", "medium", "mid"):
+        return theme.paint("Spark X2.6 has no medium level - its levels are none, low and high "
+                           "(max is high without the thinking budget)", "warning")
+    current = reasoning_level(ctx.cfg)
     if not argument:
-        table = {
-            "none": "no thinking block, fastest answers",
-            "low": "short thinking block",
-            "high": "long thinking block, best for hard work",
-        }
-        out = [theme.paint("Reasoning level", "bold"), f"  current: {ctx.cfg.think}"]
-        out.append("")
-        for level, detail in table.items():
-            mark = theme.paint("*", "success") if ctx.cfg.think == level else " "
+        out = [theme.paint("Reasoning level", "bold"), f"  current: {current}", ""]
+        for level, detail in REASONING_LEVELS.items():
+            mark = theme.paint("*", "success") if current == level else " "
             out.append(f" {mark} {theme.paint(level.ljust(6), 'accent')}{theme.paint(detail, 'dim')}")
         out.append("")
-        out.append(theme.paint("Set with /reasoning <level>.", "dim"))
+        out.append(theme.paint("Spark X2.6 itself has three levels (none, low, high); max is high", "dim"))
+        out.append(theme.paint("without the harness's thinking budget. Set with /reasoning <level>.", "dim"))
         return _lines(*out)
-
-    if argument not in ("none", "low", "high"):
-        return theme.paint(f"unknown level {argument!r}; use none, low or high", "warning")
-    ctx.cfg.think = argument
-    # The thinking level is rendered into the prompt, so it applies to the
-    # very next turn - no reload needed.
-    return theme.paint(f"reasoning level set to {argument}", "success")
+    if argument not in REASONING_LEVELS:
+        return theme.paint(f"unknown level {argument!r}; use none, low, high or max", "warning")
+    if argument == current:
+        return theme.paint(f"already at {argument}", "dim")
+    previous_think = ctx.cfg.think
+    ctx.cfg.think = "high" if argument == "max" else argument
+    ctx.cfg.think_budget = int(ctx.cfg.max_tokens) if argument == "max" else 0
+    note = ""
+    if ctx.cfg.think != previous_think:
+        # The level is written into the first system block of the prompt.
+        note = " - the prompt cache restarts on the next turn"
+    return theme.paint(f"reasoning level set to {argument}{note}", "success")
 
 
 # --------------------------------------------------------------------------
@@ -494,7 +566,18 @@ def cmd_resume(ctx: Context):
         return theme.paint(f"could not restore {target}", "warning")
     # The session may have been recorded in another project.
     ctx.ws = ctx.agent.ws
-    return theme.paint(f"resumed {Path(target).name}", "success")
+    note = ""
+    if hasattr(ctx.engine, "restore_slot") and ctx.engine.restore_slot(ctx.agent.session_id):
+        note = " (KV cache restored, no recompute)"
+    return theme.paint(f"resumed {Path(target).name}{note}", "success")
+
+
+@command("/thinking", "show the model's last thinking block in full")
+def cmd_thinking(ctx: Context):
+    text = getattr(ctx.agent, "last_reasoning", "") or ""
+    if not text.strip():
+        return ctx.theme.paint("no thinking recorded yet", "dim")
+    return _lines(ctx.theme.paint("Last thinking", "bold"), "", ctx.theme.paint(text.strip(), "muted"))
 
 
 @command("/exit", "leave the agent", aliases=("/quit", "/q"))
@@ -671,6 +754,108 @@ def cmd_transcript(ctx: Context):
     return _lines(ctx.theme.paint("Transcript", "bold"), f"  {path}")
 
 
+@command("/settings", "every model and engine setting on one page: temperature, sampling, "
+         "thinking, context, GPU, personality, sessions", aliases=("/config",))
+def cmd_settings(ctx: Context):
+    import settings  # noqa: PLC0415
+
+    summary = settings.interactive(ctx.agent)
+    if summary is None:
+        return settings.table(ctx.cfg, ctx.agent)
+    return ctx.theme.paint(summary, "success")
+
+
+@command("/set", "change one setting: /set temp 0.7, /set ctx 65536, /set personality be brief")
+def cmd_set(ctx: Context):
+    import settings  # noqa: PLC0415
+
+    theme = ctx.theme
+    parts = (ctx.agent.current_argument or "").split(None, 1)
+    if not parts:
+        return settings.table(ctx.cfg, ctx.agent)
+    key = parts[0].lower().replace("-", "_")
+    aliases = {"temperature": "temp", "heat": "temp", "context": "ctx", "gpu": "ngl",
+               "budget": "think_budget", "thinking": "think", "repeat_penalty": "repeat"}
+    key = aliases.get(key, key)
+    if key not in settings.BY_KEY:
+        if f"agent.{key}" in settings.BY_KEY:
+            key = f"agent.{key}"
+        else:
+            return theme.paint(f"no setting called {parts[0]!r} - /set lists them", "warning")
+    spec = settings.BY_KEY[key]
+    if len(parts) == 1:
+        return f"  {key} = {settings.show(settings.get(ctx.cfg, ctx.agent, key))}  " + theme.paint(spec["help"], "dim")
+    before = {s["key"]: settings.get(ctx.cfg, ctx.agent, s["key"]) for s in settings.SETTINGS}
+    try:
+        settings.set_value(ctx.cfg, ctx.agent, key, settings.convert(spec, parts[1]))
+    except ValueError as exc:
+        return theme.paint(f"{key}: {exc}", "warning")
+    return theme.paint(settings.finish(ctx.agent, before), "success")
+
+
+def _installer():
+    import install  # noqa: PLC0415 - only needed by these commands
+
+    return install
+
+
+@command("/update", "pull a new version of Spark Code from git: /update [--force]",
+         aliases=("/update-spark", "/upgrade"))
+def cmd_update(ctx: Context):
+    import spark_cli  # noqa: PLC0415
+
+    args = (ctx.agent.current_argument or "").split()
+    code = spark_cli.cmd_update(args)
+    if code == 0:
+        return ctx.theme.paint("restart Spark (/exit, then spark) to load a new version", "dim")
+    return None
+
+
+@command("/cuda", "GPU engine: /cuda status, /cuda install (CUDA, Vulkan or CPU, picked for this PC)",
+         aliases=("/gpu",))
+def cmd_cuda(ctx: Context):
+    theme = ctx.theme
+    args = (ctx.agent.current_argument or "").split()
+    action = args[0].lower() if args else "status"
+    installer = _installer()
+    if action not in ("install", "setup", "on"):
+        installer.print_hardware()
+        llama = Path(ctx.cfg.llama_dir)
+        engine = ("CUDA" if (llama / "ggml-cuda.dll").is_file() else
+                  "Vulkan" if (llama / "ggml-vulkan.dll").is_file() else "CPU")
+        return _lines("", f"  running now: {engine} build  {theme.paint(str(llama), 'dim')}",
+                      theme.paint("  /cuda install sets up the best engine for this PC", "dim"))
+    target = installer.install_accelerated(args[1:], assume_yes=True)
+    if target is None or Path(target) == Path(ctx.cfg.llama_dir):
+        return None
+    ctx.cfg.llama_dir = str(target)
+    note = ctx.agent.invalidate_engine()
+    return theme.paint(f"engine switched to {Path(target).name}; it starts with the next instruction"
+                       + (f" ({note})" if note else ""), "success")
+
+
+@command("/hardware", "show the CPU, RAM, GPU and NPU and the best engine for them", aliases=("/hw",))
+def cmd_hardware(ctx: Context):
+    _installer().print_hardware()
+    return None
+
+
+@command("/repair", "fix a broken install: downloads, config, launcher, caches (--restore resets changed files)",
+         aliases=("/fix",))
+def cmd_repair(ctx: Context):
+    args = (ctx.agent.current_argument or "").split()
+    _installer().repair(args, in_agent=True)
+    return None
+
+
+@command("/version", "show the version and the build")
+def cmd_version(ctx: Context):
+    import spark_cli  # noqa: PLC0415
+
+    spark_cli.cmd_version([])
+    return None
+
+
 @command("/about", "what this agent is and how it is wired")
 def cmd_about(ctx: Context):
     theme = ctx.theme
@@ -699,6 +884,11 @@ def dispatch(ctx: Context, line: str) -> str | None:
     argument = parts[1].strip() if len(parts) > 1 else ""
     entry = REGISTRY.get(name)
     if entry is None:
+        skill = skill_commands(ctx).get(name)
+        if skill is not None:
+            task = (f"Follow the {skill['id']} skill below."
+                    + (f" Focus: {argument}" if argument else "") + "\n\n" + skill["body"])
+            return AgentTask(task)
         # An unknown slash line is not a command, so it goes to the model
         # as an instruction like any other text.
         return None

@@ -29,12 +29,16 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import http.client
 import json
 import os
+import queue
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -45,6 +49,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import commands as slash_commands
+import settings as settings_store
 import tui
 import winproc
 
@@ -344,6 +349,14 @@ class SparkTemplate:
                     )
             elif role == "user":
                 out.append(self.bos + "<|User|>" + self.render_content(content) + self.eos)
+            elif role == "assistant" and isinstance(message.get("raw"), str):
+                # The exact text the model generated, after the exact
+                # generation prompt it was given. Re-rendering it from the
+                # parsed parts would change whitespace and argument
+                # formatting, and the server would have to recompute the
+                # whole prompt (this model's sliding-window layers cannot
+                # roll back), so it goes back byte for byte.
+                out.append(self.bos + "<|Bot|>" + message.get("raw_prefix", "") + message["raw"] + self.eos)
             elif role == "assistant":
                 out.append(self.bos + "<|Bot|>")
                 reasoning = message.get("reasoning_content")
@@ -388,6 +401,9 @@ class SparkTemplate:
 # --------------------------------------------------------------------------
 MAX_READ_LINES = 400
 MAX_OUTPUT_CHARS = 6000
+# About 2,000 tokens: one read_file result may not crowd out the rest of a
+# 32K context. The model is told how to read on.
+MAX_READ_CHARS = 8000
 TEXT_SUFFIXES = {".txt", ".md", ".py", ".rs", ".js", ".ts", ".tsx", ".jsx", ".json",
                  ".toml", ".yaml", ".yml", ".ini", ".cfg", ".bat", ".ps1", ".sh",
                  ".c", ".h", ".cpp", ".hpp", ".java", ".go", ".rb", ".php", ".cs",
@@ -396,6 +412,10 @@ TEXT_SUFFIXES = {".txt", ".md", ".py", ".rs", ".js", ".ts", ".tsx", ".jsx", ".js
 
 class ToolError(Exception):
     pass
+
+
+class GenerationCancelled(KeyboardInterrupt):
+    """The user pressed Esc while the model was generating."""
 
 
 class Workspace:
@@ -439,12 +459,22 @@ def tool_read_file(ws: Workspace, path: str, start_line: int = 1, end_line: int 
     if start > len(lines):
         return f"(file has {len(lines)} lines; start_line {start} is past the end)"
     chunk = lines[start - 1:end]
+    note = ""
     if len(chunk) > MAX_READ_LINES:
         chunk = chunk[:MAX_READ_LINES]
-        note = f"\n... (truncated at {MAX_READ_LINES} lines, use start_line/end_line to continue)"
-    else:
-        note = ""
-    body = "\n".join(f"{start + i:>5}| {line}" for i, line in enumerate(chunk))
+    rows = []
+    used = 0
+    for i, line in enumerate(chunk):
+        row = f"{start + i:>5}| {line}"
+        if rows and used + len(row) + 1 > MAX_READ_CHARS:
+            break
+        rows.append(row)
+        used += len(row) + 1
+    shown_end = start + len(rows) - 1
+    if shown_end < min(end, len(lines)):
+        note = (f"\n... (showing lines {start}-{shown_end} of {len(lines)}; "
+                f"call read_file with start_line={shown_end + 1} to continue)")
+    body = "\n".join(rows)
     return f"{path} ({len(lines)} lines)\n{body}{note}"
 
 
@@ -576,7 +606,11 @@ def tool_run_command(ws: Workspace, command: str, timeout: int = 60) -> str:
     output = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr.strip() else "")
     output = output.strip()
     if len(output) > MAX_OUTPUT_CHARS:
-        output = output[:MAX_OUTPUT_CHARS] + f"\n... (truncated, exit code {proc.returncode})"
+        # Keep both ends: commands print what they did first and the error
+        # or the summary last.
+        half = MAX_OUTPUT_CHARS // 2
+        skipped = len(output) - 2 * half
+        output = output[:half] + f"\n... ({skipped} characters skipped) ...\n" + output[-half:]
     return f"$ {command}\nexit code: {proc.returncode}\n{output}"
 
 
@@ -641,7 +675,7 @@ def load_skills(skills_dir: Path) -> list:
         if skill_file is None or not skill_file.is_file():
             continue
         text = skill_file.read_text(encoding="utf-8", errors="replace")
-        name, description, body = entry.name, "", text
+        name, description, body, slash = entry.name, "", text, ""
         if text.startswith("---"):
             parts = text.split("---", 2)
             if len(parts) >= 3:
@@ -652,7 +686,10 @@ def load_skills(skills_dir: Path) -> list:
                         description = line.split(":", 1)[1].strip()
                     elif line.lower().startswith("name:"):
                         name = line.split(":", 1)[1].strip()
-        skills.append({"id": entry.name, "name": name, "description": description, "body": body})
+                    elif line.lower().startswith("command:"):
+                        slash = line.split(":", 1)[1].strip()
+        skills.append({"id": entry.name, "name": name, "description": description, "body": body,
+                       "command": slash})
     return skills
 
 
@@ -930,11 +967,14 @@ def load_project_instructions(root: Path) -> str:
     return "\n\n".join(parts)
 
 
-def build_system_prompt(workspace: Path, skills: list, instructions: str = "") -> str:
+def build_system_prompt(workspace: Path, skills: list, instructions: str = "",
+                        personality: str = "") -> str:
     lines = [
         "You are Spark Agent, a coding agent working inside a workspace directory.",
         "",
         f"Workspace: {workspace}",
+        "Shell: run_command uses cmd.exe on Windows - use dir, type, findstr, where;"
+        " head, tail, wc and grep do not exist there.",
         "",
         "How to work:",
         "1. Look before you edit. Use list_dir, grep and read_file to find the real text.",
@@ -950,6 +990,8 @@ def build_system_prompt(workspace: Path, skills: list, instructions: str = "") -
         lines.append(f"- {skill['id']}: {skill['description']}")
     if not skills:
         lines.append("- (none)")
+    if personality and personality.strip():
+        lines += ["", "Personality and style:", personality.strip()]
     if instructions:
         lines += [
             "",
@@ -1032,7 +1074,10 @@ class CliEngine:
         self.cli = Path(cfg.llama_dir) / "llama-cli.exe"
         self.stats = {}
 
-    def generate(self, prompt: str) -> str:
+    streams = False
+
+    def generate(self, prompt: str, n_predict: int | None = None, on_text=None,
+                 should_cancel=None, temperature: float | None = None) -> str:
         prompt_file = self.cfg.tmp_dir / "prompt.txt"
         prompt_file.write_text(prompt, encoding="utf-8")
         command = [
@@ -1059,7 +1104,7 @@ class CliEngine:
             "--top-p", str(self.cfg.top_p),
             "--top-k", str(self.cfg.top_k),
             "--repeat-penalty", str(self.cfg.repeat),
-            "-n", str(self.cfg.max_tokens),
+            "-n", str(int(n_predict or self.cfg.max_tokens)),
         ]
         env = dict(os.environ)
         env["LLAMA_ARG_CHAT_TEMPLATE_KWARGS"] = json.dumps(
@@ -1092,6 +1137,23 @@ class CliEngine:
         return estimate_tokens(text)
 
 
+def gpu_args(cfg) -> list:
+    """GPU offload flags for llama-server.
+
+    --ngl auto offloads every layer when the llama.cpp build in use has a
+    GPU backend (ggml-cuda.dll or ggml-vulkan.dll), and keeps everything on
+    the CPU otherwise.
+    """
+    value = str(getattr(cfg, "ngl", "auto")).lower()
+    if value == "auto":
+        folder = Path(cfg.llama_dir)
+        has_gpu = any((folder / dll).is_file() for dll in ("ggml-cuda.dll", "ggml-vulkan.dll"))
+        value = "all" if has_gpu else "0"
+    if value in ("0", "none", "off"):
+        return ["-ngl", "0", "--device", "none"]
+    return ["-ngl", value]
+
+
 class ServerEngine:
     """Posts the rendered prompt to llama-server over the OpenAI API."""
 
@@ -1116,13 +1178,9 @@ class ServerEngine:
             return
         server = Path(self.cfg.llama_dir) / "llama-server.exe"
         log = (self.cfg.tmp_dir / "llama-server.log").open("w", encoding="utf-8")
+        # The harness renders the prompt itself and posts raw completions,
+        # so the server's own chat template settings play no part.
         env = dict(os.environ)
-        env["LLAMA_ARG_CHAT_TEMPLATE_KWARGS"] = json.dumps(
-            {
-                "enable_thinking": self.cfg.think != "none",
-                "reasoning_effort": self.cfg.think if self.cfg.think != "none" else "high",
-            }
-        )
         command = [
             str(server),
             "-m", str(self.cfg.model),
@@ -1139,11 +1197,16 @@ class ServerEngine:
             "--poll", "50",
             "--parallel", "1",
             "--load-mode", self.cfg.load_mode,
-            "-ngl", "0",
-            "--device", "none",
-            "--jinja",
-            "--reasoning-format", "deepseek",
+            # Prompt reuse on a sliding-window model: keep checkpoints close
+            # together so a prompt that differs near its end can resume from
+            # one instead of being recomputed from the start.
+            "--checkpoint-min-step", str(self.cfg.checkpoint_step),
+            "--ctx-checkpoints", str(self.cfg.checkpoints),
+            "--cache-ram", str(self.cfg.cache_ram),
+            "--slot-save-path", str(Path(self.cfg.tmp_dir) / "slots"),
+            *gpu_args(self.cfg),
         ]
+        (Path(self.cfg.tmp_dir) / "slots").mkdir(parents=True, exist_ok=True)
         self.process = subprocess.Popen(
             command, cwd=str(self.cfg.llama_dir), stdout=log, stderr=subprocess.STDOUT, env=env
         )
@@ -1174,41 +1237,180 @@ class ServerEngine:
         except Exception:
             return False
 
-    def generate(self, prompt: str) -> str:
-        # The prompt is already rendered, so send it as a raw completion.
+    streams = True
+
+    def generate(self, prompt: str, n_predict: int | None = None, on_text=None,
+                 should_cancel=None, temperature: float | None = None) -> str:
+        """Stream one completion of an already rendered prompt.
+
+        on_text(piece) is called for every piece of text and with None about
+        ten times a second while nothing arrives (for the spinner); when it
+        returns True the generation is stopped early (the thinking budget).
+        should_cancel() is polled the same way; True aborts the request and
+        raises GenerationCancelled. The request runs in a thread so the
+        prompt-processing wait can be cancelled too.
+        """
         body = json.dumps(
             {
                 "prompt": prompt,
-                "temperature": self.cfg.temp,
+                "temperature": float(temperature if temperature is not None else self.cfg.temp),
                 "top_p": self.cfg.top_p,
                 "top_k": self.cfg.top_k,
+                "min_p": float(getattr(self.cfg, "min_p", 0.0)),
+                "typical_p": float(getattr(self.cfg, "typical_p", 1.0)),
                 "repeat_penalty": self.cfg.repeat,
-                "n_predict": self.cfg.max_tokens,
+                "repeat_last_n": int(getattr(self.cfg, "repeat_last_n", 64)),
+                "presence_penalty": float(getattr(self.cfg, "presence_penalty", 0.0)),
+                "frequency_penalty": float(getattr(self.cfg, "frequency_penalty", 0.0)),
+                "seed": int(getattr(self.cfg, "seed", -1)),
+                "n_predict": int(n_predict or self.cfg.max_tokens),
                 "cache_prompt": True,
+                "id_slot": 0,
+                "stream": True,
                 "stop": [],
             }
         ).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.base}/completion",
-            data=body,
-            headers={"Content-Type": "application/json"},
-        )
+        events: queue.Queue = queue.Queue()
+        conn = http.client.HTTPConnection(self.cfg.host, self.cfg.port, timeout=self.cfg.timeout)
+        # http.client drops conn.sock once a streamed response starts, so
+        # the socket is kept here to be able to cut the stream off.
+        held: dict = {}
+
+        def worker():
+            try:
+                conn.request("POST", "/completion", body=body,
+                             headers={"Content-Type": "application/json"})
+                held["sock"] = conn.sock
+                response = conn.getresponse()
+                if response.status != 200:
+                    detail = response.read().decode("utf-8", "replace")[:2000]
+                    events.put(("error", f"llama-server error {response.status}: {detail}"))
+                    return
+                for line in response:
+                    line = line.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    events.put(("chunk", chunk))
+                    if chunk.get("stop"):
+                        break
+            except Exception as exc:  # noqa: BLE001 - reported to the caller
+                events.put(("error", f"{type(exc).__name__}: {exc}"))
+            finally:
+                events.put(("end", None))
+
         started = time.time()
-        try:
-            with urllib.request.urlopen(request, timeout=self.cfg.timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"llama-server error {exc.code}: {exc.read().decode('utf-8', 'replace')[:2000]}")
-        content = payload.get("content", "")
-        timings = payload.get("timings") or {}
-        self.stats = {
-            "output_tokens": payload.get("tokens_predicted") or 0,
-            "prompt_tokens": payload.get("tokens_evaluated") or 0,
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        parts: list = []
+        final: dict = {}
+        error = ""
+        stopped_early = False
+        cancelled = False
+        while True:
+            try:
+                kind, item = events.get(timeout=0.1)
+            except queue.Empty:
+                if on_text is not None:
+                    on_text(None)
+                if should_cancel is not None and should_cancel():
+                    cancelled = True
+                    break
+                continue
+            if kind == "chunk":
+                piece = item.get("content") or ""
+                if piece:
+                    parts.append(piece)
+                    if on_text is not None and on_text(piece):
+                        stopped_early = True
+                        break
+                if item.get("stop"):
+                    final = item
+                if should_cancel is not None and should_cancel():
+                    cancelled = True
+                    break
+            elif kind == "error":
+                error = item
+            else:
+                break
+        if cancelled or stopped_early:
+            # Closing the socket makes llama-server stop generating.
+            sock = held.get("sock") or conn.sock
+            try:
+                if sock is not None:
+                    sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            conn.close()
+            thread.join(timeout=2)
+        else:
+            conn.close()
+        if cancelled:
+            raise GenerationCancelled()
+        if error and not parts:
+            raise RuntimeError(error)
+
+        timings = final.get("timings") or {}
+        processed = timings.get("prompt_n")
+        cached = timings.get("cache_n")
+        if cached is None:
+            cached = final.get("tokens_cached")
+        stats = {
+            "output_tokens": final.get("tokens_predicted") or len(parts),
+            "prompt_tokens": final.get("tokens_evaluated") or 0,
             "tps": float(timings.get("predicted_per_second") or 0.0),
             "prompt_tps": float(timings.get("prompt_per_second") or 0.0),
+            "stop_type": final.get("stop_type") or ("budget" if stopped_early else ""),
+            "stopped_early": stopped_early,
         }
-        print(f"    [server turn {time.time() - started:.1f}s]", flush=True)
-        return content
+        if isinstance(processed, int) and isinstance(cached, int) and processed + cached > 0:
+            stats["prompt_processed"] = processed
+            stats["prompt_cached"] = cached
+            stats["prompt_tokens"] = processed + cached
+            stats["cache_pct"] = 100.0 * cached / (processed + cached)
+        self.stats = stats
+        if on_text is None:
+            print(f"    [server turn {time.time() - started:.1f}s]", flush=True)
+        return "".join(parts)
+
+    # -- KV cache on disk ----------------------------------------------------
+    def _slot_action(self, action: str, name: str) -> bool:
+        try:
+            body = json.dumps({"filename": name}).encode("utf-8")
+            request = urllib.request.Request(
+                f"{self.base}/slots/0?action={action}", data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return response.status == 200
+        except Exception:
+            return False
+
+    def save_slot(self, session_id: str) -> bool:
+        """Write the KV cache of this session next to its transcript."""
+        if not self.running:
+            return False
+        ok = self._slot_action("save", f"session-{session_id}.bin")
+        folder = Path(self.cfg.tmp_dir) / "slots"
+        try:
+            files = sorted(folder.glob("session-*.bin"), key=lambda p: p.stat().st_mtime)
+            for old in files[:-5]:
+                old.unlink()
+        except OSError:
+            pass
+        return ok
+
+    def restore_slot(self, session_id: str) -> bool:
+        """Load a saved KV cache so a resumed session is not recomputed."""
+        if not (Path(self.cfg.tmp_dir) / "slots" / f"session-{session_id}.bin").is_file():
+            return False
+        return self._slot_action("restore", f"session-{session_id}.bin")
 
     # -- token counting ---------------------------------------------------
     def count_tokens(self, text: str) -> int:
@@ -1359,7 +1561,7 @@ class SparkAgent:
         self.instructions = load_project_instructions(ws.root)
         self.transcript = None
         self.messages = [
-            {"role": "system", "content": build_system_prompt(ws.root, skills, self.instructions)},
+            {"role": "system", "content": build_system_prompt(ws.root, skills, self.instructions, getattr(cfg, "personality", ""))},
         ]
         # slash command state
         self.current_argument = ""
@@ -1371,17 +1573,28 @@ class SparkAgent:
         self.ctx_tokens = 0
         self.session_id = time.strftime("%Y%m%d-%H%M%S")
         self.session_path = None
+        self.last_reasoning = ""
 
     # ------------------------------------------------------------------
     # conversation
     # ------------------------------------------------------------------
+    def system_prompt(self) -> str:
+        return build_system_prompt(self.ws.root, self.skills, self.instructions,
+                                   getattr(self.cfg, "personality", ""))
+
     def reset(self):
         self.messages = [
             {"role": "system",
-             "content": build_system_prompt(self.ws.root, self.skills, self.instructions)},
+             "content": self.system_prompt()},
         ]
         self.turns = 0
         self.stats = {}
+        # A new conversation is a new session: the old one stays on disk for
+        # /resume instead of being overwritten by the next save.
+        self.session_id = time.strftime("%Y%m%d-%H%M%S")
+        self.session_path = None
+        self.transcript = None
+        self.last_reasoning = ""
 
     def _record(self, role: str, text: str):
         """Append the exchange to a session transcript next to the logs."""
@@ -1494,9 +1707,7 @@ class SparkAgent:
         self.ws = Workspace(Path(path))
         self.instructions = load_project_instructions(self.ws.root)
         if self.messages and self.messages[0].get("role") == "system":
-            self.messages[0]["content"] = build_system_prompt(
-                self.ws.root, self.skills, self.instructions
-            )
+            self.messages[0]["content"] = self.system_prompt()
         remember_project(self.ws.root)
 
     def read_last_project(self) -> str:
@@ -1573,8 +1784,7 @@ class SparkAgent:
             + "\n\n".join(lines)
         )
         messages = [
-            {"role": "system", "content": build_system_prompt(
-                self.ws.root, self.skills, self.instructions)},
+            {"role": "system", "content": self.system_prompt()},
             {"role": "user", "content": request},
         ]
         enable_thinking = self.cfg.think != "none"
@@ -1583,14 +1793,13 @@ class SparkAgent:
             reasoning_effort=self.cfg.think if enable_thinking else "high",
             add_generation_prompt=True,
         )
-        raw = self.engine.generate(prompt)
+        raw = self.engine.generate(prompt, temperature=getattr(self.cfg, "compact_temp", None))
         _reasoning, content = split_thinking(raw)
         summary = content.strip()
         if not summary:
             return None
         self.messages = [
-            {"role": "system", "content": build_system_prompt(
-                self.ws.root, self.skills, self.instructions)},
+            {"role": "system", "content": self.system_prompt()},
             {"role": "user", "content": (
                 "Summary of the work so far, kept as the only context:\n\n" + summary
             )},
@@ -1615,6 +1824,66 @@ class SparkAgent:
     # ------------------------------------------------------------------
     # the turn
     # ------------------------------------------------------------------
+    def think_budget(self) -> int:
+        """Thinking tokens allowed before the answer is forced."""
+        budget = int(getattr(self.cfg, "think_budget", 0) or 0)
+        if budget > 0:
+            return budget
+        return 1024 if self.cfg.think == "low" else 4096
+
+    def _generate(self, prompt: str, enable_thinking: bool) -> tuple:
+        """One model call. Returns (raw text, whether it was shown live).
+
+        The raw text is exactly what follows the generation prompt, so it
+        can go back into the history byte for byte. When the thinking block
+        runs past the budget, the block is closed for the model and the same
+        prompt continues - the closing tag is part of the raw text from then
+        on, so the history still matches the server's cache.
+        """
+        engine = self.engine
+        if not getattr(engine, "streams", False):
+            raw = engine.generate(prompt)
+            if enable_thinking and "</think>" not in raw:
+                raw += "</think>"
+            return raw, False
+
+        view = tui.StreamView(tui.THEME, thinking=enable_thinking)
+        budget = self.think_budget() if enable_thinking else 0
+
+        def on_text(piece):
+            if piece is None:
+                view.tick()
+                return False
+            view.feed(piece)
+            return bool(budget) and view.in_think and view.think_tokens >= budget
+
+        def on_text_no_budget(piece):
+            if piece is None:
+                view.tick()
+            else:
+                view.feed(piece)
+            return False
+
+        try:
+            raw = engine.generate(prompt, on_text=on_text, should_cancel=tui.esc_pressed)
+            if engine.stats.get("stopped_early") and view.in_think:
+                closing = "\n</think>\n\n"
+                view.feed(closing)
+                remaining = max(512, self.cfg.max_tokens - view.tokens)
+                more = engine.generate(
+                    prompt + raw + closing, n_predict=remaining,
+                    on_text=on_text_no_budget,
+                    should_cancel=tui.esc_pressed,
+                )
+                raw = raw + closing + more
+        finally:
+            view.finish()
+        if enable_thinking and "</think>" not in raw:
+            # The output limit was reached inside the thinking block. Close it,
+            # so the reasoning is never mistaken for the answer.
+            raw += "</think>"
+        return raw, view.content_shown
+
     def turn(self, task: str) -> str:
         """Run one instruction to completion and return the final answer."""
         self.ensure_engine()
@@ -1623,41 +1892,52 @@ class SparkAgent:
         self.turns += 1
         enable_thinking = self.cfg.think != "none"
         reasoning_effort = self.cfg.think if self.cfg.think != "none" else "high"
+        gen_prefix = "<think>" if enable_thinking else "</think>"
+        theme = tui.THEME
 
         for step in range(1, self.cfg.max_steps + 1):
             prompt = self.template.render(
                 self.messages, tools=self.tools, enable_thinking=enable_thinking,
                 reasoning_effort=reasoning_effort, add_generation_prompt=True,
             )
-            raw = self.engine.generate(prompt)
+            raw, shown = self._generate(prompt, enable_thinking)
             reasoning, content = split_thinking(raw)
             calls = parse_tool_calls(content)
-            content = content.strip()
+            visible = content.split("<tool_call>", 1)[0].strip()
+            self.last_reasoning = reasoning or self.last_reasoning
 
             self.stats = dict(getattr(self.engine, "stats", {}) or {})
 
-            if reasoning:
-                print(f"\n--- think ---\n{reasoning}\n---------------")
+            if reasoning and not getattr(self.engine, "streams", False):
+                print(theme.paint(f"✻ thought ({estimate_tokens(reasoning)} tokens) · /thinking shows it", "dim"))
+
+            message = {
+                "role": "assistant",
+                "content": visible if calls else content.strip(),
+                "reasoning_content": reasoning,
+                "raw": raw,
+                "raw_prefix": gen_prefix,
+            }
 
             if not calls:
-                print("\n=== answer ===")
-                print(content or "(empty)")
-                self._record("agent", content or "(empty)")
+                answer = content.strip()
+                self.messages.append(message)
+                if not shown:
+                    print(answer or theme.paint("(empty answer)", "dim"))
+                if not answer and self.stats.get("stop_type") == "limit":
+                    print(theme.paint(f"[stopped] the {self.cfg.max_tokens}-token output limit was reached", "warning"))
+                self._record("agent", answer or "(empty)")
                 self.save_session()
-                return content
+                return answer
 
-            print(f"\n[step {step}] {len(calls)} tool call(s)")
-            self.messages.append(
-                {
-                    "role": "assistant",
-                    "content": content,
-                    "reasoning_content": reasoning,
-                    "tool_calls": calls,
-                }
-            )
+            message["tool_calls"] = calls
+            self.messages.append(message)
+            if not shown and visible:
+                print(visible)
 
             for call in calls:
-                print(f"  -> {call['name']} {json.dumps(call['arguments'], ensure_ascii=False)[:300]}")
+                print(theme.paint(f"  ● {call['name']} ", "accent")
+                      + theme.paint(json.dumps(call["arguments"], ensure_ascii=False)[:200], "dim"))
                 result = execute_tool(
                     call["name"], call["arguments"], self.ws, self.skills,
                     web=self.web, mcp=self.mcp,
@@ -1665,16 +1945,20 @@ class SparkAgent:
                 )
                 if result.startswith("__FINISH__:"):
                     summary = result[len("__FINISH__:"):].strip()
-                    print("\n=== answer ===")
+                    # Close the call so the history stays a valid sequence.
+                    self.messages.append({"role": "tool", "content": "done"})
+                    print()
                     print(summary)
                     self._record("agent", summary)
                     self.save_session()
                     return summary
-                print(f"  <- {result[:400]}")
+                first = result.strip().splitlines()[0] if result.strip() else "(no output)"
+                more = len(result.strip().splitlines()) - 1
+                print(theme.paint(f"    └ {first[:160]}" + (f"  (+{more} lines)" if more > 0 else ""), "dim"))
                 self._record("tool", f"{call['name']} {json.dumps(call['arguments'], ensure_ascii=False)[:200]}\n{result[:800]}")
                 self.messages.append({"role": "tool", "content": result})
 
-        print(f"\n[stopped] reached the {self.cfg.max_steps}-step limit")
+        print(theme.paint(f"\n[stopped] reached the {self.cfg.max_steps}-step limit", "warning"))
         self.save_session()
         return ""
 
@@ -1745,8 +2029,15 @@ def repl(agent: SparkAgent, ctx):
             result = slash_commands.dispatch(ctx, task)
         except Exception as exc:  # noqa: BLE001
             result = f"error in {task.split()[0]}: {type(exc).__name__}: {exc}"
-        if result is not None:
+        if isinstance(result, slash_commands.AgentTask):
+            task = result.text
+        elif result is not None:
             print(result)
+            print()
+            agent.refresh_context_tokens()
+            continue
+        elif task.startswith("/") and task.split()[0].lower() in slash_commands.REGISTRY:
+            # The command printed its own output.
             print()
             agent.refresh_context_tokens()
             continue
@@ -1788,10 +2079,19 @@ def build_parser():
     parser.add_argument("--template", default=str(DEFAULT_ROOT / "spark26-chat-template.jinja"))
     parser.add_argument("--think", default="high", choices=["high", "low", "none"])
     parser.add_argument("--max-steps", type=int, default=12)
-    parser.add_argument("--max-tokens", type=int, default=1024)
-    parser.add_argument("--ctx", type=int, default=16384)
-    parser.add_argument("--threads", type=int, default=8)
-    parser.add_argument("--threads-batch", type=int, default=16)
+    parser.add_argument("--max-tokens", type=int, default=8192,
+                        help="output tokens per model call, thinking included")
+    parser.add_argument("--think-budget", type=int, default=0,
+                        help="thinking tokens before the answer is forced (0 = 1024 at low, 4096 at high)")
+    parser.add_argument("--ctx", type=int, default=32768)
+    parser.add_argument("--threads", type=int, default=6,
+                        help="generation threads (the Core Ultra 5 225F has 6 P-cores)")
+    parser.add_argument("--threads-batch", type=int, default=10)
+    parser.add_argument("--ngl", default="auto",
+                        help="GPU layers: auto (all when the build has CUDA), 0, a number or all")
+    parser.add_argument("--checkpoint-step", type=int, default=512)
+    parser.add_argument("--checkpoints", type=int, default=16)
+    parser.add_argument("--cache-ram", type=int, default=2048, help="MiB of host RAM for prompt checkpoints")
     parser.add_argument("--batch", type=int, default=2048)
     parser.add_argument("--ubatch", type=int, default=512)
     parser.add_argument("--ctk", default="f16")
@@ -1817,6 +2117,9 @@ def build_parser():
 def main(argv=None):
     use_utf8_console()
     cfg = build_parser().parse_args(argv)
+    argv_given = list(argv) if argv is not None else sys.argv[1:]
+    # Saved /settings values, unless the same setting was given as a flag.
+    settings_store.apply_saved(cfg, None, settings_store.explicit_keys(argv_given))
 
     root = Path(cfg.llama_dir)
     if not (root / "llama-cli.exe").exists() and not (root / "llama-server.exe").exists():
@@ -1913,7 +2216,8 @@ def main(argv=None):
     if cfg.render:
         messages = [
             {"role": "system",
-             "content": build_system_prompt(ws.root, skills, load_project_instructions(ws.root))},
+             "content": build_system_prompt(ws.root, skills, load_project_instructions(ws.root),
+                                                getattr(cfg, "personality", ""))},
             {"role": "user", "content": task or "Say hello."},
         ]
         print(template.render(
@@ -1940,6 +2244,7 @@ def main(argv=None):
     )
     try:
         agent = SparkAgent(cfg, engine, ws, skills, tools, template, web=web, mcp=mcp)
+        settings_store.apply_saved(cfg, agent, settings_store.explicit_keys(argv_given))
         ctx.agent = agent
         if interactive:
             return repl(agent, ctx)
@@ -1953,6 +2258,9 @@ def main(argv=None):
             except Exception:
                 pass
         if cfg.engine == "server":
+            agent_ref = ctx.agent
+            if agent_ref is not None and len(agent_ref.messages) > 1 and hasattr(engine, "save_slot"):
+                engine.save_slot(agent_ref.session_id)
             note = engine.stop()
             if note:
                 print(f"[server] {note}")
