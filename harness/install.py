@@ -325,6 +325,18 @@ def run_selftest() -> None:
         for line in tail[:10]:
             print(f"    {line}")
 
+    # The prompt box is checked against a fake console, so a redraw that
+    # throws the caret out of the box fails the install too.
+    step("running the prompt box test")
+    code, out = run_cmd([sys.executable, str(HERE / "tui_test.py")], cwd=HERE, timeout=120)
+    tail = [line for line in out.splitlines() if line.startswith("[FAIL]")]
+    if code == 0:
+        good("prompt box test passed")
+    else:
+        fail("prompt box test failed")
+        for line in tail[:10]:
+            print(f"    {line}")
+
 
 def seed_remembered_project() -> None:
     """Carry the project across from an earlier install, if there is one.

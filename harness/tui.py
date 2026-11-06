@@ -238,81 +238,138 @@ class PromptBox:
         self.width = width or min(term_width(), 100)
         self.text = ""
         self.cursor = 0
+        # Lines in the last drawn block (box plus footer) and the row the
+        # cursor was left on inside it. The cursor is deliberately parked
+        # inside the box, so the redraw has to walk back to the top of the
+        # block from where the cursor is, not from the bottom of it.
         self._drawn = 0
+        self._cursor_row = 0
         # A callable returning the footer lines drawn under the box.
         self.footer = lambda: []
 
     # -- geometry ---------------------------------------------------------
+    def _inner(self) -> int:
+        """Width of the text area inside the box."""
+        return max(20, self.width - 4)
+
     def _rows(self) -> list:
-        """The visible rows of the box for the current text."""
-        inner = max(20, self.width - 4)
-        rows = []
-        for chunk in self._wrap(self.text, inner) or [""]:
-            rows.append(chunk)
-        return rows
+        """The visible rows of the box as (text, offset) pairs.
+
+        The offset is the position of the row's first character in the
+        un-wrapped text, so the caret can be placed exactly even when the
+        text has wrapped.
+        """
+        # Two cells of every row belong to the "> " marker, so the text
+        # wraps two cells earlier. pad() never truncates, so a full row
+        # would otherwise push the right hand border out past the top and
+        # bottom borders.
+        inner = max(1, self._inner() - 2)
+        return self._wrap(self.text, inner) or [("", 0)]
 
     @staticmethod
     def _wrap(text: str, inner: int) -> list:
+        """Wrap text into rows of at most `inner` characters.
+
+        Returns [(row_text, offset), ...] where offset is the index of the
+        row's first character in `text`. A word is broken at the last
+        space that fits and the space is dropped, which is exactly why the
+        offsets are tracked instead of recomputed.
+        """
+        rows: list = []
         if not text:
-            return []
-        out = []
+            return rows
+        position = 0
         for paragraph in text.split("\n"):
-            if not paragraph:
-                out.append("")
-                continue
-            while len(paragraph) > inner:
-                cut = paragraph.rfind(" ", 0, inner)
-                if cut <= 0:
-                    cut = inner
-                out.append(paragraph[:cut])
-                paragraph = paragraph[cut:].lstrip()
-            out.append(paragraph)
-        return out
+            start = 0
+            if paragraph:
+                while start < len(paragraph):
+                    end = min(start + inner, len(paragraph))
+                    if end < len(paragraph):
+                        space = paragraph.rfind(" ", start + 1, end)
+                        if space > start:
+                            end = space
+                    rows.append((paragraph[start:end], position + start))
+                    start = end
+                    if start < len(paragraph) and paragraph[start] == " ":
+                        start += 1
+            else:
+                rows.append(("", position))
+            position += len(paragraph) + 1
+        return rows
 
     def _cursor_position(self, rows: list) -> tuple:
-        """(line, column) of the cursor inside the wrapped rows."""
-        inner = max(20, self.width - 4)
-        consumed = 0
-        for index, row in enumerate(rows):
-            if self.cursor <= consumed + len(row):
-                return index, self.cursor - consumed
-            consumed += len(row) + 1
+        """(row index, column offset) of the caret inside the wrapped rows."""
+        for index, (row, offset) in enumerate(rows):
+            if self.cursor <= offset + len(row):
+                return index, self.cursor - offset
         return max(0, len(rows) - 1), 0
 
     # -- painting ---------------------------------------------------------
     def paint(self) -> list:
         theme = self.theme
         rows = self._rows()
-        inner = max(20, self.width - 4)
+        inner = self._inner()
         body = []
-        for row in rows:
+        for row, _offset in rows:
             body.append(theme.paint(">", "accent") + " " + theme.paint(row, "title"))
         if not body:
             body = [theme.paint(">", "accent") + " "]
         return box(body, inner, color="border")
 
     def draw(self):
+        """Redraw the box (and the footer) with the caret inside it.
+
+        Everything is done with *relative* cursor moves. An absolute move
+        would have to know where the block starts on the screen, and the
+        block moves as the conversation grows - which is what used to
+        throw the caret into the banner.
+        """
         lines = self.paint()
         footer = list(self.footer() or [])
+        block = lines + footer
         out = sys.stdout
         if self._drawn:
-            out.write(f"\x1b[{self._drawn}A")
+            # The caret is parked inside the box, on content row
+            # self._cursor_row. The block starts one line above content
+            # row 0, so walk up exactly that far. Walking up the whole
+            # block height instead overshoots into whatever is above the
+            # box and the erase below wipes it.
+            out.write(f"\x1b[{self._cursor_row + 1}A")
+        # Column one, and wipe everything from here down so the previous
+        # drawing cannot survive underneath the new one.
         out.write("\r\x1b[J")
-        for line in lines:
-            out.write(line + "\n")
-        for line in footer:
-            out.write(line + "\n")
+        for line in block:
+            # Explicit CRLF: a bare LF leaves the column where the line
+            # ended, and every relative move below counts on the caret
+            # being at column one.
+            out.write(line + "\r\n")
         rows = self._rows()
-        line, column = self._cursor_position(rows)
-        out.write(f"\x1b[{line + 2};{column + 3}H")
+        row, column = self._cursor_position(rows)
+        # The caret is now one line below the whole block. Walk it back up
+        # to the content row it belongs on, then across to just after the
+        # "| > " prefix.
+        up = len(block) - 1 - row
+        if up > 0:
+            out.write(f"\x1b[{up}A")
+        out.write(f"\x1b[{4 + column}C")
         out.flush()
-        self._drawn = len(lines) + len(footer)
+        self._drawn = len(block)
+        self._cursor_row = row
 
     def finish(self):
-        """Leave the finished box on screen and move past it."""
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        """Leave the finished box on screen and put the caret below it."""
+        out = sys.stdout
+        if self._drawn:
+            # The caret is inside the box. Walk it down to the line under
+            # the whole block, so the answer does not land on top of the
+            # box or the footer.
+            down = self._drawn - self._cursor_row - 1
+            if down > 0:
+                out.write(f"\x1b[{down}B")
+            out.write("\r")
+        out.flush()
         self._drawn = 0
+        self._cursor_row = 0
 
     # -- editing ----------------------------------------------------------
     def insert(self, char: str):
@@ -357,6 +414,10 @@ def read_prompt(prompt_box: PromptBox, history: list | None = None) -> str:
         return _plain_prompt(prompt_box)
 
     if not sys.stdin.isatty():
+        return _plain_prompt(prompt_box)
+    if not prompt_box.theme.enabled:
+        # The console cannot do ANSI, so the cursor moves would print as
+        # garbage. Fall back to a plain prompt.
         return _plain_prompt(prompt_box)
 
     box = prompt_box
@@ -430,7 +491,6 @@ def read_prompt(prompt_box: PromptBox, history: list | None = None) -> str:
 
 def _plain_prompt(prompt_box: PromptBox) -> str:
     """Fallback when the console cannot do key-at-a-time input."""
-    theme = prompt_box.theme
     lines = prompt_box.paint()
     sys.stdout.write(lines[0] + "\n")
     try:
@@ -438,6 +498,8 @@ def _plain_prompt(prompt_box: PromptBox) -> str:
     except EOFError:
         raise
     sys.stdout.write(lines[-1] + "\n")
+    for line in prompt_box.footer() or []:
+        sys.stdout.write(line + "\n")
     # A PowerShell pipe writes UTF-8 with a BOM, so the first line would
     # otherwise start with an invisible character.
     return text.strip().lstrip("\ufeff").strip()

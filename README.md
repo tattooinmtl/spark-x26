@@ -31,6 +31,7 @@ C:\models\spark26\
 │   ├── gguf_info.py             read GGUF metadata without loading the model
 │   ├── validate_template.py     proves the Python template port == llama.cpp's
 │   ├── selftest.py              checks that need no model
+│   ├── tui_test.py              drives the prompt box against a fake console
 │   └── skills\                  small skills, loaded on demand
 │       ├── read-code\  edit-code\  verify\  debug\  plan\
 ├── llama\
@@ -417,6 +418,16 @@ the llama-cli timing footer, the terminal UI (box widths, the footer's
 right-alignment, the context colour thresholds, the editing keys), the slash
 command registry and dispatch, the web tools, the MCP bridge and the session
 files that `/resume` reads. 82 checks, all passing.
+
+**`harness/tui_test.py`** drives the prompt box against a fake console that
+interprets the escape sequences, so the redraw is checked without a human
+eyeballing it: the caret sits just after the `> ` marker and follows the
+text, a redraw replaces the box instead of stacking another one under it,
+whatever is above the box survives, the borders stay the same width when the
+text wraps, and Enter leaves the caret on the line below the block so the
+answer cannot land on top of the box or the footer. It also fails the run if
+the box ever uses an absolute cursor move, which is what used to throw the
+caret into the banner. 49 checks, all passing. The installer runs it too.
 
 Both were run against the real model and the real server.
 
