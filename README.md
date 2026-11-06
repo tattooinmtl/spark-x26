@@ -315,6 +315,8 @@ a second or two.
 `harness/tui.py` draws the session. It follows PI.DEV's shape and Claude
 Code's border.
 
+![the prompt box with the cursor after the text](docs/tui-fixed.png)
+
 - **The title** is the app name in the ANSI Shadow figlet font, `SPARK CODE`
   on the first line and `2.6` centred under it, boxed in violet. If the
   window is too narrow to box it, the art is printed on its own rather than
@@ -333,6 +335,12 @@ Code's border.
 The counters come from the engine itself: `llama-server` reports its own
 timings and token counts, and the CLI engine's timing footer is parsed the
 same way.
+
+The box is drawn with **relative** cursor moves only. An absolute move
+would have to know where the block sits on the screen, and the block moves
+as the conversation grows — that is what used to throw the caret into the
+banner. Sending an instruction leaves the box on screen and draws the next
+one empty underneath it, so the answer can never land on top of the prompt.
 
 ## Slash commands
 
