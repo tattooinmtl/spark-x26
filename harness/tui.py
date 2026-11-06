@@ -435,6 +435,10 @@ def read_prompt(prompt_box: PromptBox, history: list | None = None) -> str:
             text = box.text.strip().lstrip("\ufeff").strip()
             if text and history and history[-1] != text:
                 history.append(text)
+            # The submitted instruction stays on screen, but the next one
+            # starts empty - otherwise it would be typed onto the end of
+            # the last one.
+            box.clear()
             return text
         if char == "\x03":          # Ctrl+C
             box.finish()

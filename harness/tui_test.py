@@ -364,16 +364,30 @@ def test_read_prompt():
     screen = driver.screen
     try:
         text = tui.read_prompt(driver.box, [])
+
+        check("tui: read_prompt returns the text", text, "hello")
+        check("tui: the typed text is in the box",
+              "│ > hello" in screen.lines()[1], True)
+        check("tui: the box is emptied for the next prompt", driver.box.text, "")
+        check("tui: the caret is below the box", screen.row, 6)
+        check("tui: the caret is at the left edge", screen.col, 1)
+        check("tui: read_prompt uses no absolute moves", screen.absolute_moves, 0)
+
+        # The next prompt starts empty, so a new instruction is not typed
+        # onto the end of the last one. The submitted box stays on screen
+        # and the new one is drawn below it.
+        driver.box.draw()
+        lines = screen.lines()
+        check("tui: the submitted prompt stays on screen",
+              "│ > hello" in lines[1], True)
+        check("tui: the next prompt is empty", lines[6][4:-1].strip(), "")
+        check("tui: the next box is below the first", lines[5].startswith("╭"), True)
+        check("tui: there are two boxes", screen.screen().count("╭"), 2)
     finally:
         msvcrt.getwch = saved_getwch
         sys.stdin = saved_stdin
         driver.restore()
 
-    check("tui: read_prompt returns the text", text, "hello")
-    check("tui: the typed text is in the box", "│ > hello" in screen.lines()[1], True)
-    check("tui: the caret is below the box", screen.row, 6)
-    check("tui: the caret is at the left edge", screen.col, 1)
-    check("tui: read_prompt uses no absolute moves", screen.absolute_moves, 0)
     return failures
 
 
@@ -398,4 +412,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # The console is cp1252 by default and the box is full of box drawing
+    # characters, so the report would not survive it.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     sys.exit(main())
